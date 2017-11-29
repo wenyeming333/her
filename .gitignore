@@ -105,3 +105,4 @@ venv.bak/
 
 # log_files
 log/
+data/
