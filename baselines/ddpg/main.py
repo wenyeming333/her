@@ -71,8 +71,11 @@ def run(env_id, seed, noise_type, layer_norm, evaluation, **kwargs):
     # Disable logging for rank != 0 to avoid noise.
     if rank == 0:
         start_time = time.time()
+
+    envs = [gym.make(env_id) for i in range(16)]
+
     training.train(env=env, eval_env=eval_env, param_noise=param_noise,
-        action_noise=action_noise, actor=actor, critic=critic, memory=memory, **kwargs)
+        action_noise=action_noise, actor=actor, critic=critic, memory=memory, envs=envs, **kwargs)
     env.close()
     if eval_env is not None:
         eval_env.close()
@@ -83,7 +86,7 @@ def run(env_id, seed, noise_type, layer_norm, evaluation, **kwargs):
 def parse_args():
     parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
 
-    parser.add_argument('--env-id', type=str, default='HalfCheetah-v1')
+    parser.add_argument('--env-id', type=str, default='HindsightReacher-v0')
     boolean_flag(parser, 'render-eval', default=False)
     boolean_flag(parser, 'layer-norm', default=True)
     boolean_flag(parser, 'render', default=False)
@@ -102,11 +105,12 @@ def parse_args():
     parser.add_argument('--nb-epoch-cycles', type=int, default=50)
     parser.add_argument('--nb-cycle-eps', type=int, default=16)
     parser.add_argument('--nb-train-steps', type=int, default=40)  # per epoch cycle and MPI worker
-    parser.add_argument('--nb-eval-steps', type=int, default=100)  # per epoch cycle and MPI worker
+    parser.add_argument('--nb-eval-steps', type=int, default=50)  # per epoch cycle and MPI worker
     parser.add_argument('--nb-rollout-steps', type=int, default=50)  # per epoch cycle and MPI worker
     # parser.add_argument('--noise-type', type=str, default='adaptive-param_0.2')  # choices are adaptive-param_xx, ou_xx, normal_xx, none
-    parser.add_argument('--noise-type', type=str, default='ou_0.3')
+    parser.add_argument('--noise-type', type=str, default='normal_0.3')
     parser.add_argument('--num-timesteps', type=int, default=None)
+    # parser.add_argument('--log_dir', type=str, default='log/')
     boolean_flag(parser, 'evaluation', default=False)
     boolean_flag(parser, 'hindsight', default=False)
     args = parser.parse_args()
@@ -122,6 +126,6 @@ def parse_args():
 if __name__ == '__main__':
     args = parse_args()
     if MPI.COMM_WORLD.Get_rank() == 0:
-        logger.configure()
+        logger.configure('log/')
     # Run actual script.
     run(**args)

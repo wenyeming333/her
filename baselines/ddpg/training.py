@@ -5,18 +5,52 @@ import pickle
 
 from baselines.ddpg.ddpg import DDPG
 from baselines.ddpg.util import mpi_mean, mpi_std, mpi_max, mpi_sum
+from multiprocessing import Process, Pipe
 import baselines.common.tf_util as U
-
 from baselines import logger
 import numpy as np
 import tensorflow as tf
 from mpi4py import MPI
 
+def rollout(agent, _env, nb_rollout_steps, hindsight, reward_shared, timesteps_shared):
+    max_action = _env.action_space.high
+    obs = _env.reset()
+    # Hindsight initilization.
+    reward = 0
+    timesteps = 0
+    if hindsight:
+        hindsight_ob_pair = [] 
+        hindsight_action = []
+    for t_rollout in range(nb_rollout_steps):
+        action, q = agent.pi(obs, apply_noise=True, compute_Q=True)
+        assert action.shape == env.action_space.shape
+        assert max_action.shape == action.shape
+        new_obs, r, done, info = env.step(max_action * action)  # scale for execution in env (as far as DDPG is concerned, every action is in [-1, 1])
+        time_step += 1
+        reward += r
+        agent.store_transition(obs, action, r, new_obs, done)
+        # Hindsight
+        if hindsight:
+            hindsight_ob_pair.append((obs,new_obs))
+            hindsight_action.append(action)
+        obs = new_obs
+        if done:
+            # Hindsight
+            if hindsight:
+                final_position = env.unwrapped.compute_position(new_obs)
+                goal1 = final_position
+                for (state_pair,action) in zip(hindsight_ob_pair,hindsight_action):
+                    r, s1, s2, done = env.unwrapped.hindsight_reward(state_pair, action, goal1)
+                    agent.store_transition(s1, action, r, s2, done) # Does it matter that Done=False?
+                    if done: break
+            break
+    reward_shared.append(reward)
+    timesteps_shared.append(timesteps)
 
 def train(env, nb_epochs, nb_epoch_cycles, nb_cycle_eps, render_eval, reward_scale, render, param_noise, actor, critic,
     normalize_returns, normalize_observations, critic_l2_reg, actor_lr, critic_lr, action_noise,
     popart, gamma, clip_norm, nb_train_steps, nb_rollout_steps, nb_eval_steps, batch_size, memory,
-    tau=0.05, eval_env=None, param_noise_adaption_interval=50, hindsight=False):
+    tau=0.05, eval_env=None, param_noise_adaption_interval=50, hindsight=False, envs=None):
     rank = MPI.COMM_WORLD.Get_rank()
 
     assert (np.abs(env.action_space.low) == env.action_space.high).all()  # we assume symmetric actions.
@@ -40,13 +74,14 @@ def train(env, nb_epochs, nb_epoch_cycles, nb_cycle_eps, render_eval, reward_sca
     episode = 0
     eval_episode_rewards_history = deque(maxlen=100)
     episode_rewards_history = deque(maxlen=100)
-    with U.single_threaded_session() as sess:
+
+    # with U.single_threaded_session() as sess:
+    with U.make_session(16) as sess:
+    # with tf.Session() as sess:
         # Prepare everything.
         agent.initialize(sess)
         sess.graph.finalize()
 
-        agent.reset()
-        obs = env.reset()
         if eval_env is not None:
             eval_obs = eval_env.reset()
         done = False
@@ -66,72 +101,74 @@ def train(env, nb_epochs, nb_epoch_cycles, nb_cycle_eps, render_eval, reward_sca
         epoch_actions = []
         epoch_qs = []
         epoch_episodes = 0
+
+        # agent.reset()
+        # obs = env.reset()
+
         for epoch in range(nb_epochs):
             for cycle in range(nb_epoch_cycles):
                 # Perform rollouts.
-                for eps in range(nb_cycle_eps):
-                # Hindsight initilization.
-                    if hindsight:
-                        hindsight_ob_pair = [] 
-                        hindsight_action = []
+                reward_shared = []
+                timesteps_shared = []
+                ps = [Process(target=rollout, args=(agent, _env, nb_rollout_steps, hindsight, 
+                    [], [])) for _env in envs]                
+                for p in ps:
+                    p.start()
+                for p in ps:
+                    p.join()
 
-                    for t_rollout in range(nb_rollout_steps):
-                        # Predict next action.
-                        action, q = agent.pi(obs, apply_noise=True, compute_Q=True)
-                        assert action.shape == env.action_space.shape
+                # for eps in range(nb_cycle_eps):
+                #     # Hindsight initilization.
+                #     if hindsight:
+                #         hindsight_ob_pair = [] 
+                #         hindsight_action = []
 
-                        # Execute next action.
-                        if rank == 0 and render:
-                            env.render()
-                        assert max_action.shape == action.shape
-                        new_obs, r, done, info = env.step(max_action * action)  # scale for execution in env (as far as DDPG is concerned, every action is in [-1, 1])
-                        t += 1
-                        if rank == 0 and render:
-                            env.render()
-                        episode_reward += r
-                        episode_step += 1
+                #     for t_rollout in range(nb_rollout_steps):
+                #         # Predict next action.
+                #         action, q = agent.pi(obs, apply_noise=True, compute_Q=True)
+                #         assert action.shape == env.action_space.shape
 
-                        # Book-keeping.
-                        epoch_actions.append(action)
-                        epoch_qs.append(q)
-                        agent.store_transition(obs, action, r, new_obs, done)
+                #         # Execute next action.
+                #         if rank == 0 and render:
+                #             env.render()
+                #         assert max_action.shape == action.shape
+                #         new_obs, r, done, info = env.step(max_action * action)  # scale for execution in env (as far as DDPG is concerned, every action is in [-1, 1])
+                #         t += 1
 
-                        # Hindsight
-                        if hindsight:
-                            hindsight_ob_pair.append((obs,new_obs))
-                            hindsight_action.append(action)
+                #         episode_reward += r
+                #         episode_step += 1
 
-                        obs = new_obs
-                        if done:
-                            # Hindsight
-                            if hindsight:
-                                final_position = env.unwrapped.compute_position(new_obs)
-                                goal1 = final_position
-                                # goal1 = env.unwrapped.sample_goal(final_position)
-                                # goal2 = env.unwrapped.sample_goal(final_position)
-                                for (state_pair,action) in zip(hindsight_ob_pair,hindsight_action):
-                                    r, s1, s2, done = env.unwrapped.hindsight_reward(state_pair, action, goal1)
-                                    agent.store_transition(s1, action, r, s2, False) # Does it matter that Done=False?
-                                    # if done: break
+                #         # Book-keeping.
+                #         epoch_actions.append(action)
+                #         epoch_qs.append(q)
+                #         agent.store_transition(obs, action, r, new_obs, done)
 
-                                # for (state_pair,action) in zip(hindsight_ob_pair,hindsight_action):
-                                #     r, s1, s2, done = env.unwrapped.hindsight_reward(state_pair, action, goal2)
-                                #     agent.store_transition(s1, action, r, s2, done) # Does it matter that Done=False?
-                                #     if done: break
-                                    # r, s1, s2, done2 = env.unwrapped.hindsight_reward(state_pair, action, goal2)
-                                    # agent.store_transition(s1, action, r, s2, False) # Does it matter that Done=False?
+                #         # Hindsight
+                #         if hindsight:
+                #             hindsight_ob_pair.append((obs,new_obs))
+                #             hindsight_action.append(action)
 
-                            # Episode done.
-                            epoch_episode_rewards.append(episode_reward)
-                            episode_rewards_history.append(episode_reward)
-                            epoch_episode_steps.append(episode_step)
-                            episode_reward = 0.
-                            episode_step = 0
-                            epoch_episodes += 1
-                            episodes += 1
-
-                            agent.reset()
-                            obs = env.reset()
+                #         obs = new_obs
+                #         if done:
+                #             # Hindsight
+                #             if hindsight:
+                #                 final_position = env.unwrapped.compute_position(new_obs)
+                #                 goal1 = final_position
+                #                 for (state_pair,action) in zip(hindsight_ob_pair,hindsight_action):
+                #                     r, s1, s2, done = env.unwrapped.hindsight_reward(state_pair, action, goal1)
+                #                     agent.store_transition(s1, action, r, s2, done) # Does it matter that Done=False?
+                #                     if done: break
+                #             # Episode done.
+                #             epoch_episode_rewards.append(episode_reward)
+                #             episode_rewards_history.append(episode_reward)
+                #             epoch_episode_steps.append(episode_step)
+                #             episode_reward = 0.
+                #             episode_step = 0
+                #             epoch_episodes += 1
+                #             episodes += 1
+                #             agent.reset()
+                #             obs = env.reset()
+                #             break
 
                 # Train.
                 epoch_actor_losses = []
@@ -179,25 +216,25 @@ def train(env, nb_epochs, nb_epoch_cycles, nb_cycle_eps, render_eval, reward_sca
                 combined_stats[key] = mpi_mean(stats[key])
 
             # Rollout statistics.
-            combined_stats['rollout/return'] = mpi_mean(epoch_episode_rewards)
+            # combined_stats['rollout/return'] = mpi_mean(epoch_episode_rewards)
             combined_stats['rollout/return_history'] = mpi_mean(np.mean(episode_rewards_history))
-            combined_stats['rollout/episode_steps'] = mpi_mean(epoch_episode_steps)
+            # combined_stats['rollout/episode_steps'] = mpi_mean(epoch_episode_steps)
             combined_stats['rollout/episodes'] = mpi_sum(epoch_episodes)
-            combined_stats['rollout/actions_mean'] = mpi_mean(epoch_actions)
-            combined_stats['rollout/actions_std'] = mpi_std(epoch_actions)
-            combined_stats['rollout/Q_mean'] = mpi_mean(epoch_qs)
+            # combined_stats['rollout/actions_mean'] = mpi_mean(epoch_actions)
+            # combined_stats['rollout/actions_std'] = mpi_std(epoch_actions)
+            # combined_stats['rollout/Q_mean'] = mpi_mean(epoch_qs)
     
             # Train statistics.
-            combined_stats['train/loss_actor'] = mpi_mean(epoch_actor_losses)
-            combined_stats['train/loss_critic'] = mpi_mean(epoch_critic_losses)
-            combined_stats['train/param_noise_distance'] = mpi_mean(epoch_adaptive_distances)
+            # combined_stats['train/loss_actor'] = mpi_mean(epoch_actor_losses)
+            # combined_stats['train/loss_critic'] = mpi_mean(epoch_critic_losses)
+            # combined_stats['train/param_noise_distance'] = mpi_mean(epoch_adaptive_distances)
 
             # Evaluation statistics.
-            if eval_env is not None:
-                combined_stats['eval/return'] = mpi_mean(eval_episode_rewards)
-                combined_stats['eval/return_history'] = mpi_mean(np.mean(eval_episode_rewards_history))
-                combined_stats['eval/Q'] = mpi_mean(eval_qs)
-                combined_stats['eval/episodes'] = mpi_mean(len(eval_episode_rewards))
+            # if eval_env is not None:
+            #     combined_stats['eval/return'] = mpi_mean(eval_episode_rewards)
+            #     combined_stats['eval/return_history'] = mpi_mean(np.mean(eval_episode_rewards_history))
+            #     combined_stats['eval/Q'] = mpi_mean(eval_qs)
+            #     combined_stats['eval/episodes'] = mpi_mean(len(eval_episode_rewards))
 
             # Total statistics.
             combined_stats['total/duration'] = mpi_mean(duration)
